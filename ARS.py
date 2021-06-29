@@ -1,148 +1,232 @@
+import datetime,gym,os,pybullet_envs,time,os,psutil,ray
 import numpy as np
 import tensorflow as tf
-import datetime,gym,os,pybullet_envs,time,psutil,ray
-import itertools
-from model import *
-import random
+from model import MLP, get_noises_from_weights
 from config import *
 from collections import deque
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# from util import gpu_sess,suppress_tf_warning
+np.set_printoptions(precision=2)
+# suppress_tf_warning() # suppress warning
+gym.logger.set_level(40) # gym logger
 print ("Packaged loaded. TF version is [%s]."%(tf.__version__))
 
-RENDER_ON_EVAL = True
+RENDER_ON_EVAL = False
+
+class RolloutWorkerClass(object):
+    """
+    Worker without RAY (for update purposes)
+    """
+    def __init__(self, hdims=[128], actv='relu', out_actv='tanh', seed=1):
+        self.seed = seed
+        self.env = get_env()
+        odim, adim = self.env.observation_space.shape[0], self.env.action_space.shape[0]
+        self.odim = odim
+        self.adim = adim
+        # ARS Model
+        self.mu = MLP(odim, adim, hdims=hdims, actv=actv, out_actv=out_actv)
+        # Initialize model
+        tf.random.set_seed(self.seed)
+        np.random.seed(self.seed)
+
+    @tf.function
+    def get_action(self, o):
+        return self.mu(o)[0]
+
+    @tf.function
+    def get_weights(self):
+        """
+        Get weights
+        """
+        weight_vals = self.mu.trainable_weights
+        return weight_vals
+
+    @tf.function
+    def set_weights(self, weight_vals):
+        """
+        Set weights without memory leakage
+        """
+        for old_weight, new_weight  in zip(self.mu.trainable_weights, weight_vals):
+            old_weight.assign(new_weight)
+
+@ray.remote
+class RayRolloutWorkerClass(object):
+    """
+    Rollout Worker with RAY
+    """
+    def __init__(self,worker_id=0,
+                 hdims=[128],actv='relu',out_actv='tanh',
+                 ep_len_rollout=1000):
+        self.worker_id = worker_id
+        self.ep_len_rollout = ep_len_rollout
+        self.env = get_env()
+        odim, adim = self.env.observation_space.shape[0], self.env.action_space.shape[0]
+        self.odim = odim
+        self.adim = adim
+        # ARS Model
+        self.mu = MLP(odim, adim, hdims=hdims, actv=actv, out_actv=out_actv)
+
+    @tf.function
+    def get_action(self, o):
+        return self.mu(o)[0]
+
+    # @tf.function
+    def set_weights(self, weight_vals, noise_vals, noise_sign=+1):
+        """
+        Set weights without memory leakage
+        """
+        for idx, weight in enumerate(self.mu.trainable_weights):
+            weight.assign(weight_vals[idx]+noise_sign*noise_vals[idx])
+
+    def rollout(self):
+        """
+        Rollout
+        """
+        # Loop
+        self.o = self.env.reset() # reset always
+        r_sum,step = 0,0
+        for t in range(self.ep_len_rollout):
+            self.a = self.get_action(self.o.reshape(1, -1))
+            self.o2,self.r,self.d,_ = self.env.step(self.a)
+            # Save next state
+            self.o = self.o2
+            # Accumulate reward
+            r_sum += self.r
+            step += 1
+            if self.d: break
+        return r_sum,step
 
 class Agent(object):
     def __init__(self, seed=1):
         self.seed = seed
         # Environment
-        self.env, self.eval_env = get_envs()
+        self.env = get_env()
         odim, adim = self.env.observation_space.shape[0],self.env.action_space.shape[0]
         self.odim = odim
         self.adim = adim
 
-        # Actor-critic model
-        self.mu = MLP(self.odim, self.adim, hdims)
+        ray.init(num_cpus=n_cpu)
+        self.R = RolloutWorkerClass(hdims=hdims, actv=actv, out_actv=out_actv, seed=0)
+        self.workers = [RayRolloutWorkerClass.remote(
+            worker_id=i, hdims=hdims, actv=actv, out_actv=out_actv,
+            ep_len_rollout=ep_len_rollout
+        ) for i in range(n_workers)]
 
-        # self.model.compile()
-        # self.target.compile()
-
-
-        # Initialize model
-        tf.random.set_seed(self.seed)
-        np.random.seed(self.seed)
-        random.seed(self.seed)
-
-        # self.pi_loss_metric = tf.keras.metrics.Mean(name="pi_loss")
-        # self.value_loss_metric = tf.keras.metrics.Mean(name="Q_loss")
-        # self.q1_metric = tf.keras.metrics.Mean(name="Q1")
-        # self.q2_metric = tf.keras.metrics.Mean(name="Q2")
-        # self.log_path = "./log/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        # self.summary_writer = tf.summary.create_file_writer(self.log_path + "/summary/")
-
-
-    def get_action(self, o, deterministic=False):
-        return self.mu(tf.constant(o.reshape(1, -1)), deterministic)
-
-    # get weihts from model and target layer
-    def get_weights(self):
-        weight_vals = self.mu.get_weights()
-        return weight_vals
-
-    def set_weights(self, weight_vals, noise_vals, noise_sign=+1):
-        return self.mu.set_weights(weight_vals)
+        self.log_path = "./log/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.summary_writer = tf.summary.create_file_writer(self.log_path + "/summary/")
 
     def train(self, load_dir=None):
         start_time = time.time()
-        latests_100_score = deque(maxlen=100)
-        if load_dir:
-            loaded_ckpt = tf.train.latest_checkpoint(load_dir)
-            self.mu.load_weights(loaded_ckpt)
-            print('load weights')
+        n_env_step = 0
+        eval_env = get_eval_env()
+        latest_100_score = deque(maxlen=100)
+        # if load_dir:
+        #     loaded_ckpt = tf.train.latest_checkpoint(load_dir)
+        #     self.mu.load_weights(loaded_ckpt)
+        #     print('load weights')
+        for t in range(int(total_steps)):
+            # Distribute worker weights
+            weights = self.R.get_weights()
+            noises_list = []
+            for _ in range(n_workers):
+                noises_list.append(get_noises_from_weights(weights, nu=nu))
 
-        weights = self.get_weights()
-        noises_list = []
+            # Positive rollouts (noise_sign=+1)
+            set_weights_list = [worker.set_weights.remote(weights, noises, noise_sign=1)
+                                for worker, noises in zip(self.workers, noises_list)]
+            ops = [worker.rollout.remote() for worker in self.workers]
+            res_pos = ray.get(ops)
+            rollout_pos_vals, r_idx = np.zeros(n_workers), 0
+            for rew, eplen in res_pos:
+                rollout_pos_vals[r_idx] = rew
+                r_idx = r_idx + 1
+                n_env_step += eplen
 
-        o, r, d, ep_ret, ep_len, n_env_step = self.env.reset(), 0, False, 0, 0, 0
-        for epoch in range(int(total_steps)):
-            if epoch > start_steps:
-                a = self.get_action(o, deterministic=False)
-                a = a.numpy()[0]
-            else:
-                a = self.env.action_space.sample()
+            # Negative rollouts (noise_sign=-1)
+            set_weights_list = [worker.set_weights.remote(weights, noises, noise_sign=-1)
+                                for worker, noises in zip(self.workers, noises_list)]
+            ops = [worker.rollout.remote() for worker in self.workers]
+            res_neg = ray.get(ops)
+            rollout_neg_vals,r_idx = np.zeros(n_workers),0
+            for rew,eplen in res_neg:
+                rollout_neg_vals[r_idx] = rew
+                r_idx = r_idx + 1
+                n_env_step += eplen
 
-            o2, r, d, _ = self.env.step(a)
-            ep_len += 1
-            ep_ret += r
+            # Scale reward
+            rollout_pos_vals, rollout_neg_vals = rollout_pos_vals / 100, rollout_neg_vals / 100
 
-            # Save the Experience to our buffer
-            self.replay_buffer_long.store(o, a, r, o2, d)
-            self.replay_buffer_short.store(o, a, r, o2, d)
-            n_env_step += 1
-            o = o2
+            # Reward
+            rollout_concat_vals = np.concatenate((rollout_pos_vals, rollout_neg_vals))
+            rollout_delta_vals = rollout_pos_vals - rollout_neg_vals  # pos-neg
+            rollout_max_vals = np.maximum(rollout_pos_vals, rollout_neg_vals)
+            rollout_max_val = np.max(rollout_max_vals)  # single maximum
+            rollout_delta_max_val = np.max(np.abs(rollout_delta_vals))
 
-            # End of trajectory handling - reset env
-            if d:
-                o, ep_ret, ep_len = self.env.reset(), 0, 0
+            # Sort
+            sort_idx = np.argsort(-rollout_max_vals)
 
-            # Perform SAC update!
-            if epoch >= start_steps:
-                for _ in range(int(update_count)):
-                    batch = self.replay_buffer_long.sample_batch(batch_size//2)
-                    batch_short = self.replay_buffer_short.sample_batch(batch_size//2)
+            # Update
+            sigma_R = np.std(rollout_concat_vals)
+            weights_updated = []
+            for w_idx, weight in enumerate(weights):  # for each weight
+                delta_weight_sum = np.zeros_like(weight)
+                for k in range(b):
+                    idx_k = sort_idx[k]  # sorted index
+                    rollout_delta_k = rollout_delta_vals[idx_k]
+                    noises_k = noises_list[idx_k]
+                    noise_k = (1 / nu) * noises_k[w_idx]  # noise for current weight
+                    delta_weight_sum += rollout_delta_k * noise_k
+                delta_weight = (alpha / (b * sigma_R)) * delta_weight_sum
+                weight = weight + delta_weight
+                weights_updated.append(weight)
 
-                    batch = {k: tf.constant(v) for k, v in batch.items()}
-                    batch_short = {k: tf.constant(v) for k, v in batch_short.items()}
+                # Set weight
+            self.R.set_weights(weights_updated)
 
-                    replay_buffer = dict(obs1=tf.concat([batch['obs1'], batch_short['obs1']], 0),
-                                         obs2=tf.concat([batch['obs2'], batch_short['obs2']], 0),
-                                         acts=tf.concat([batch['acts'], batch_short['acts']], 0),
-                                         rews=tf.concat([batch['rews'], batch_short['rews']], 0),
-                                         done=tf.concat([batch['done'], batch_short['done']], 0))
-                    logp_pi, min_q_pi, logp_pi_next, q_backup, q1_targ, q2_targ = self.update_sac(replay_buffer)
+            # Print
+            if (t == 0) or (((t + 1) % print_every) == 0):
+                print("[%d/%d] rollout_max_val:[%.2f] rollout_delta_max_val:[%.2f] sigma_R:[%.2f] " %
+                      (t, total_steps, rollout_max_val, rollout_delta_max_val, sigma_R))
 
             # Evaluate
-            if (((epoch + 1) % evaluate_every) == 0):
+            if (t == 0) or (((t + 1) % evaluate_every) == 0) or (t == (total_steps - 1)):
                 ram_percent = psutil.virtual_memory().percent  # memory usage
                 print("[Evaluate] step:[%d/%d][%.1f%%] #step:[%.1e] time:[%s] ram:[%.1f%%]." %
-                      (epoch + 1, total_steps, epoch / total_steps * 100,
+                      (t + 1, total_steps, t / total_steps * 100,
                        n_env_step,
                        time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time)),
                        ram_percent)
                       )
                 for eval_idx in range(num_eval):
-                    o, d, ep_ret, ep_len = self.eval_env.reset(), False, 0, 0
+                    o, d, ep_ret, ep_len = eval_env.reset(), False, 0, 0
                     if RENDER_ON_EVAL:
-                        _ = self.eval_env.render(mode='human')
+                        _ = eval_env.render(mode='human')
                     while not (d or (ep_len == max_ep_len_eval)):
-                        a = self.get_action(o, deterministic=True)
-                        o, r, d, _ = self.eval_env.step(a.numpy()[0])
+                        a = self.R.get_action(o.reshape(1, -1))
+                        o, r, d, _ = eval_env.step(a)
                         if RENDER_ON_EVAL:
-                            _ = self.eval_env.render(mode='human')
+                            _ = eval_env.render(mode='human')
                         ep_ret += r  # compute return
                         ep_len += 1
-                    print("[Evaluate] [%d/%d] ep_ret:[%.4f] ep_len:[%d]"
+                    print(" [Evaluate] [%d/%d] ep_ret:[%.4f] ep_len:[%d]"
                           % (eval_idx, num_eval, ep_ret, ep_len))
-                latests_100_score.append(ep_ret)
-                self.write_summary(epoch, latests_100_score, ep_ret, n_env_step)
-                print("Saving weights...")
-                self.model.save_weights(self.log_path + "/weights/weights")
+                latest_100_score.append(ep_ret)
+                self.write_summary(t, latest_100_score, ep_ret, n_env_step, time.time() - start_time, rollout_max_val, rollout_delta_max_val, sigma_R)
 
-    def write_summary(self, episode, latest_100_score, episode_score, total_step):
+        print("Done.")
+        eval_env.close()
+        ray.shutdown()
 
+    def write_summary(self, episode, latest_100_score, episode_score, total_step, time, rollout_max_val, rollout_delta_max_val, sigma_R):
         with self.summary_writer.as_default():
             tf.summary.scalar("Reward (clipped)", episode_score, step=episode)
             tf.summary.scalar("Latest 100 avg reward (clipped)", np.mean(latest_100_score), step=episode)
-            tf.summary.scalar("Q1", self.q1_metric.result(), step=episode)
-            tf.summary.scalar("Q2", self.q2_metric.result(), step=episode)
-            tf.summary.scalar("Value_Loss", self.value_loss_metric.result(), step=episode)
-            tf.summary.scalar("PI_Loss", self.pi_loss_metric.result(), step=episode)
             tf.summary.scalar("Total Frames", total_step, step=episode)
+            tf.summary.scalar("Time", time, step=episode)
+            tf.summary.scalar("rollout_max_val", rollout_max_val, step=episode)
+            tf.summary.scalar("rollout_delta_max_val", rollout_delta_max_val, step=episode)
+            tf.summary.scalar("sigma_R", sigma_R, step=episode)
 
-        self.q1_metric.reset_states()
-        self.q2_metric.reset_states()
-        self.value_loss_metric.reset_states()
-        self.pi_loss_metric.reset_states()
 
     def play(self, load_dir=None, trial=5):
 
@@ -164,18 +248,23 @@ class Agent(object):
             print("[Evaluate] [%d/%d] ep_ret:[%.4f] ep_len:[%d]"
                   % (i, num_eval, ep_ret, ep_len))
 
-def get_envs():
-    env_name = 'AntBulletEnv-v0'
-    env,eval_env = gym.make(env_name),gym.make(env_name)
+def get_env():
+    import pybullet_envs,gym
+    gym.logger.set_level(40) # gym logger
+    return gym.make('AntBulletEnv-v0')
+
+def get_eval_env():
+    import pybullet_envs,gym
+    gym.logger.set_level(40) # gym logger
+    eval_env = gym.make('AntBulletEnv-v0')
     if RENDER_ON_EVAL:
-        _ = eval_env.render(mode='human') # enable rendering on test_env
+        _ = eval_env.render(mode='human') # enable rendering
     _ = eval_env.reset()
     for _ in range(3): # dummy run for proper rendering
         a = eval_env.action_space.sample()
         o,r,d,_ = eval_env.step(a)
         time.sleep(0.01)
-    return env,eval_env
-
+    return eval_env
 a = Agent()
 a.train()
 # a.play('./log/success/last/')
