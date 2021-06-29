@@ -28,4 +28,4 @@ def get_noises_from_weights(weights, nu=0.01):
     for weight in weights:
         noise = nu * np.random.randn(*weight.shape)
         noises.append(noise)
-    return noises # dictionary
+    return noises

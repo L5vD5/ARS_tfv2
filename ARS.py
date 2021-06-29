@@ -10,7 +10,7 @@ np.set_printoptions(precision=2)
 gym.logger.set_level(40) # gym logger
 print ("Packaged loaded. TF version is [%s]."%(tf.__version__))
 
-RENDER_ON_EVAL = False
+RENDER_ON_EVAL = True
 
 class RolloutWorkerClass(object):
     """
@@ -47,6 +47,12 @@ class RolloutWorkerClass(object):
         """
         for old_weight, new_weight  in zip(self.mu.trainable_weights, weight_vals):
             old_weight.assign(new_weight)
+
+    def save_weight(self, log_path):
+        self.mu.save_weights(log_path + "/weights/weights")
+
+    def load_weight(self, checkpoint):
+        self.mu.load_weights(checkpoint)
 
 @ray.remote
 class RayRolloutWorkerClass(object):
@@ -212,6 +218,8 @@ class Agent(object):
                           % (eval_idx, num_eval, ep_ret, ep_len))
                 latest_100_score.append(ep_ret)
                 self.write_summary(t, latest_100_score, ep_ret, n_env_step, time.time() - start_time, rollout_max_val, rollout_delta_max_val, sigma_R)
+                print("Saving weights...")
+                self.R.save_weight(self.log_path)
 
         print("Done.")
         eval_env.close()
@@ -229,20 +237,21 @@ class Agent(object):
 
 
     def play(self, load_dir=None, trial=5):
+        eval_env = get_eval_env()
 
         if load_dir:
             loaded_ckpt = tf.train.latest_checkpoint(load_dir)
-            self.model.load_weights(loaded_ckpt)
+            self.R.load_weight(loaded_ckpt)
 
         for i in range(trial):
-            o, d, ep_ret, ep_len = self.eval_env.reset(), False, 0, 0
+            o, d, ep_ret, ep_len = eval_env.reset(), False, 0, 0
             if RENDER_ON_EVAL:
-                _ = self.eval_env.render(mode='human')
+                _ = eval_env.render(mode='human')
             while not (d or (ep_len == max_ep_len_eval)):
-                a = self.get_action(o, deterministic=True)
-                o, r, d, _ = self.eval_env.step(a.numpy()[0])
+                a = self.R.get_action(o.reshape(1, -1))
+                o, r, d, _ = eval_env.step(a)
                 if RENDER_ON_EVAL:
-                    _ = self.eval_env.render(mode='human')
+                    _ = eval_env.render(mode='human')
                 ep_ret += r  # compute return
                 ep_len += 1
             print("[Evaluate] [%d/%d] ep_ret:[%.4f] ep_len:[%d]"
@@ -266,5 +275,5 @@ def get_eval_env():
         time.sleep(0.01)
     return eval_env
 a = Agent()
-a.train()
-# a.play('./log/success/last/')
+# a.train()
+a.play('./log/1006/weights/')
