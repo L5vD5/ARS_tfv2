@@ -10,7 +10,7 @@ np.set_printoptions(precision=2)
 gym.logger.set_level(40) # gym logger
 print ("Packaged loaded. TF version is [%s]."%(tf.__version__))
 
-RENDER_ON_EVAL = True
+RENDER_ON_EVAL = False
 
 class RolloutWorkerClass(object):
     """
@@ -275,5 +275,5 @@ def get_eval_env():
         time.sleep(0.01)
     return eval_env
 a = Agent()
-# a.train()
-a.play('./log/1006/weights/')
+a.train()
+# a.play('./log/1006/weights/')
