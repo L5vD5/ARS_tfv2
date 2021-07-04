@@ -124,7 +124,11 @@ class Agent(object):
         start_time = time.time()
         n_env_step = 0
         eval_env = get_eval_env()
+        current_ret = 0
+        new_rollout_pos_vals = np.array([])
+        new_rollout_neg_vals = np.array([])
         latest_100_score = deque(maxlen=100)
+        rollout_max_val, rollout_delta_max_val, sigma_R = 0, 0, 0
         # if load_dir:
         #     loaded_ckpt = tf.train.latest_checkpoint(load_dir)
         #     self.mu.load_weights(loaded_ckpt)
@@ -158,36 +162,47 @@ class Agent(object):
                 r_idx = r_idx + 1
                 n_env_step += eplen
 
-            # Scale reward
-            rollout_pos_vals, rollout_neg_vals = rollout_pos_vals / 100, rollout_neg_vals / 100
+            target_ret = rollout_max_val + increment
+            for k in range(n_workers):
+                if (rollout_pos_vals[k] > target_ret or rollout_neg_vals[k] > target_ret):
+                    new_rollout_pos_vals = np.append(new_rollout_pos_vals, rollout_pos_vals[k])
+                    new_rollout_neg_vals = np.append(new_rollout_neg_vals, rollout_neg_vals[k])
 
-            # Reward
-            rollout_concat_vals = np.concatenate((rollout_pos_vals, rollout_neg_vals))
-            rollout_delta_vals = rollout_pos_vals - rollout_neg_vals  # pos-neg
-            rollout_max_vals = np.maximum(rollout_pos_vals, rollout_neg_vals)
-            rollout_max_val = np.max(rollout_max_vals)  # single maximum
-            rollout_delta_max_val = np.max(np.abs(rollout_delta_vals))
+            if(len(new_rollout_pos_vals) > b):
+                # Scale reward
+                new_rollout_pos_vals, new_rollout_neg_vals = new_rollout_pos_vals / 100, new_rollout_neg_vals / 100
 
-            # Sort
-            sort_idx = np.argsort(-rollout_max_vals)
+                # Reward
+                rollout_concat_vals = np.concatenate((new_rollout_pos_vals, new_rollout_neg_vals))
+                rollout_delta_vals = new_rollout_pos_vals - new_rollout_neg_vals  # pos-neg
+                rollout_max_vals = np.maximum(new_rollout_pos_vals, new_rollout_neg_vals)
+                rollout_max_val = np.max(rollout_max_vals)  # single maximum
+                rollout_delta_max_val = np.max(np.abs(rollout_delta_vals))
 
-            # Update
-            sigma_R = np.std(rollout_concat_vals)
-            weights_updated = []
-            for w_idx, weight in enumerate(weights):  # for each weight
-                delta_weight_sum = np.zeros_like(weight)
-                for k in range(b):
-                    idx_k = sort_idx[k]  # sorted index
-                    rollout_delta_k = rollout_delta_vals[idx_k]
-                    noises_k = noises_list[idx_k]
-                    noise_k = (1 / nu) * noises_k[w_idx]  # noise for current weight
-                    delta_weight_sum += rollout_delta_k * noise_k
-                delta_weight = (alpha / (b * sigma_R)) * delta_weight_sum
-                weight = weight + delta_weight
-                weights_updated.append(weight)
+                # Re-initialize
+                new_rollout_pos_vals, new_rollout_neg_vals = np.array([]), np.array([])
+
+                # Sort
+                # sort_idx = np.argsort(-rollout_max_vals)
+
+                # Update
+                sigma_R = np.std(rollout_concat_vals)
+                weights_updated = []
+                for w_idx, weight in enumerate(weights):  # for each weight
+                    delta_weight_sum = np.zeros_like(weight)
+                    for k in range(len(new_rollout_pos_vals)):
+                        # idx_k = sort_idx[k]  # sorted index
+                        rollout_delta_k = rollout_delta_vals[k]
+                        noises_k = noises_list[k]
+                        noise_k = (1 / nu) * noises_k[w_idx]  # noise for current weight
+                        delta_weight_sum += rollout_delta_k * noise_k
+                    delta_weight = (alpha / (b * sigma_R)) * delta_weight_sum
+                    weight = weight + delta_weight
+                    weights_updated.append(weight)
 
                 # Set weight
-            self.R.set_weights(weights_updated)
+                print('updated')
+                self.R.set_weights(weights_updated)
 
             # Print
             if (t == 0) or (((t + 1) % print_every) == 0):

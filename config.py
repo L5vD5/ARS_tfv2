@@ -7,6 +7,7 @@ ep_len_rollout = 1000   #1000
 num_eval = 3
 max_ep_len_eval = 1e3   #1e3
 hdims = [256,256]
+increment = 30 # 목표 ret 증가량
 actv = 'tanh'
 out_actv = 'tanh'
 
