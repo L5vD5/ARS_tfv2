@@ -23,21 +23,21 @@ class RolloutWorkerClass(object):
         self.odim = odim
         self.adim = adim
         # ARS Model
-        self.mu = MLP(odim, adim, hdims=hdims, actv=actv, out_actv=out_actv)
+        self.model = MLP(odim, adim, hdims=hdims, actv=actv, out_actv=out_actv)
         # Initialize model
         tf.random.set_seed(self.seed)
         np.random.seed(self.seed)
 
     @tf.function
     def get_action(self, o):
-        return self.mu(o)[0]
+        return self.model(o)[0]
 
     @tf.function
     def get_weights(self):
         """
         Get weights
         """
-        weight_vals = self.mu.trainable_weights
+        weight_vals = self.model.trainable_weights
         return weight_vals
 
     @tf.function
@@ -45,14 +45,14 @@ class RolloutWorkerClass(object):
         """
         Set weights without memory leakage
         """
-        for old_weight, new_weight  in zip(self.mu.trainable_weights, weight_vals):
+        for old_weight, new_weight  in zip(self.model.trainable_weights, weight_vals):
             old_weight.assign(new_weight)
 
     def save_weight(self, log_path):
-        self.mu.save_weights(log_path + "/weights/weights")
+        self.model.save_weights(log_path + "/weights/weights")
 
     def load_weight(self, checkpoint):
-        self.mu.load_weights(checkpoint)
+        self.model.load_weights(checkpoint)
 
 @ray.remote
 class RayRolloutWorkerClass(object):
@@ -69,18 +69,18 @@ class RayRolloutWorkerClass(object):
         self.odim = odim
         self.adim = adim
         # ARS Model
-        self.mu = MLP(odim, adim, hdims=hdims, actv=actv, out_actv=out_actv)
+        self.model = MLP(odim, adim, hdims=hdims, actv=actv, out_actv=out_actv)
 
     @tf.function
     def get_action(self, o):
-        return self.mu(o)[0]
+        return self.model(o)[0]
 
     # @tf.function
     def set_weights(self, weight_vals, noise_vals, noise_sign=+1):
         """
         Set weights without memory leakage
         """
-        for idx, weight in enumerate(self.mu.trainable_weights):
+        for idx, weight in enumerate(self.model.trainable_weights):
             weight.assign(weight_vals[idx]+noise_sign*noise_vals[idx])
 
     def rollout(self):
@@ -127,7 +127,7 @@ class Agent(object):
         latest_100_score = deque(maxlen=100)
         # if load_dir:
         #     loaded_ckpt = tf.train.latest_checkpoint(load_dir)
-        #     self.mu.load_weights(loaded_ckpt)
+        #     self.model.load_weights(loaded_ckpt)
         #     print('load weights')
         for t in range(int(total_steps)):
             # Distribute worker weights
