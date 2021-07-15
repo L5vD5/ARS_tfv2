@@ -45,7 +45,7 @@ class RolloutWorkerClass(object):
         """
         Set weights without memory leakage
         """
-        for old_weight, new_weight  in zip(self.mu.trainable_weights, weight_vals):
+        for old_weight, new_weight in zip(self.mu.trainable_weights, weight_vals):
             old_weight.assign(new_weight)
 
     def save_weight(self, log_path):
@@ -124,9 +124,10 @@ class Agent(object):
         start_time = time.time()
         n_env_step = 0
         eval_env = get_eval_env()
-        current_ret = 0
+        new_noises_list = []
         new_rollout_pos_vals = np.array([])
         new_rollout_neg_vals = np.array([])
+        current_ret = 0
         latest_100_score = deque(maxlen=100)
         rollout_max_val, rollout_delta_max_val, sigma_R = 0, 0, 0
         # if load_dir:
@@ -136,6 +137,7 @@ class Agent(object):
         for t in range(int(total_steps)):
             # Distribute worker weights
             weights = self.R.get_weights()
+
             noises_list = []
             for _ in range(n_workers):
                 noises_list.append(get_noises_from_weights(weights, nu=nu))
@@ -162,13 +164,17 @@ class Agent(object):
                 r_idx = r_idx + 1
                 n_env_step += eplen
 
-            target_ret = rollout_max_val + increment
+            target_ret = current_ret + increment
             for k in range(n_workers):
                 if (rollout_pos_vals[k] > target_ret or rollout_neg_vals[k] > target_ret):
                     new_rollout_pos_vals = np.append(new_rollout_pos_vals, rollout_pos_vals[k])
                     new_rollout_neg_vals = np.append(new_rollout_neg_vals, rollout_neg_vals[k])
+                    new_noises_list.append(noises_list[k])
+            # print('target_ret', target_ret)
+            # print('new_rollout_pos_vals', new_rollout_pos_vals)
+            # print('new_rollout_neg_vals', new_rollout_neg_vals)
 
-            if(len(new_rollout_pos_vals) > b):
+            if(len(new_rollout_pos_vals) > 3*b):
                 # Scale reward
                 new_rollout_pos_vals, new_rollout_neg_vals = new_rollout_pos_vals / 100, new_rollout_neg_vals / 100
 
@@ -178,31 +184,39 @@ class Agent(object):
                 rollout_max_vals = np.maximum(new_rollout_pos_vals, new_rollout_neg_vals)
                 rollout_max_val = np.max(rollout_max_vals)  # single maximum
                 rollout_delta_max_val = np.max(np.abs(rollout_delta_vals))
+                # print('rollout_concat_vals: ', rollout_concat_vals)
+                # print('rollout_delta_vals: ', rollout_delta_vals)
+                # print('rollout_max_vals: ', rollout_max_vals)
+                # print('rollout_max_val: ', rollout_max_val)
+                # print('rollout_delta_max_val: ', rollout_delta_max_val)
 
                 # Re-initialize
                 new_rollout_pos_vals, new_rollout_neg_vals = np.array([]), np.array([])
 
                 # Sort
-                # sort_idx = np.argsort(-rollout_max_vals)
+                sort_idx = np.argsort(-rollout_max_vals)
 
                 # Update
                 sigma_R = np.std(rollout_concat_vals)
+                # print(sigma_R)
                 weights_updated = []
                 for w_idx, weight in enumerate(weights):  # for each weight
                     delta_weight_sum = np.zeros_like(weight)
-                    for k in range(len(new_rollout_pos_vals)):
-                        # idx_k = sort_idx[k]  # sorted index
-                        rollout_delta_k = rollout_delta_vals[k]
-                        noises_k = noises_list[k]
-                        noise_k = (1 / nu) * noises_k[w_idx]  # noise for current weight
+                    for k in range(len(new_rollout_pos_vals) // 3):
+                        idx_k = sort_idx[k]  # sorted index
+                        rollout_delta_k = rollout_delta_vals[idx_k]
+                        noises_k = new_noises_list[idx_k]
+                        noise_k = (1 / nu) * noises_k[w_idx] # noise for current weight
                         delta_weight_sum += rollout_delta_k * noise_k
                     delta_weight = (alpha / (b * sigma_R)) * delta_weight_sum
                     weight = weight + delta_weight
+                    # print(weight)
                     weights_updated.append(weight)
 
                 # Set weight
                 print('updated')
                 self.R.set_weights(weights_updated)
+                target_ret += 15
 
             # Print
             if (t == 0) or (((t + 1) % print_every) == 0):
@@ -213,11 +227,12 @@ class Agent(object):
             if (t == 0) or (((t + 1) % evaluate_every) == 0) or (t == (total_steps - 1)):
                 ram_percent = psutil.virtual_memory().percent  # memory usage
                 print("[Evaluate] step:[%d/%d][%.1f%%] #step:[%.1e] time:[%s] ram:[%.1f%%]." %
-                      (t + 1, total_steps, t / total_steps * 100,
-                       n_env_step,
-                       time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time)),
-                       ram_percent)
-                      )
+                    (t + 1, total_steps, t / total_steps * 100,
+                    n_env_step,
+                    time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time)),
+                    ram_percent)
+                )
+                ret_sum = 0
                 for eval_idx in range(num_eval):
                     o, d, ep_ret, ep_len = eval_env.reset(), False, 0, 0
                     if RENDER_ON_EVAL:
@@ -229,9 +244,11 @@ class Agent(object):
                             _ = eval_env.render(mode='human')
                         ep_ret += r  # compute return
                         ep_len += 1
+                    ret_sum += ep_ret
                     print(" [Evaluate] [%d/%d] ep_ret:[%.4f] ep_len:[%d]"
                           % (eval_idx, num_eval, ep_ret, ep_len))
-                latest_100_score.append(ep_ret)
+                latest_100_score.append(ret_sum / num_eval)
+                current_ret = ret_sum / num_eval
                 self.write_summary(t, latest_100_score, ep_ret, n_env_step, time.time() - start_time, rollout_max_val, rollout_delta_max_val, sigma_R)
                 print("Saving weights...")
                 self.R.save_weight(self.log_path)
