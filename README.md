@@ -14,6 +14,7 @@ $ python main.py --help
 
 $ python main.py --train
 $ python main.py --play [weight_file_path]
+
 usage: main.py [-h] [--train] [--play PLAY]
 
 Atari: DQN
