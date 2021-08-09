@@ -10,7 +10,18 @@
 ## Usage
 
 ```
-python ARS.py
+$ python main.py --help
+
+$ python main.py --train
+$ python main.py --play [weight_file_path]
+usage: main.py [-h] [--train] [--play PLAY]
+
+Atari: DQN
+
+optional arguments:
+  -h, --help   show this help message and exit
+  --train      Train agent with given environment
+  --play PLAY  Play with a given weight directory
 ```
 
 ## Config
