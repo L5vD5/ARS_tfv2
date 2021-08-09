@@ -270,7 +270,7 @@ class Agent(object):
                 ep_ret += r  # compute return
                 ep_len += 1
             print("[Evaluate] [%d/%d] ep_ret:[%.4f] ep_len:[%d]"
-                  % (i, num_eval, ep_ret, ep_len))
+                  % (i, trial, ep_ret, ep_len))
 
 def get_env():
     import pybullet_envs,gym
