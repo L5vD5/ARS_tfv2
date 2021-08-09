@@ -6,7 +6,6 @@
 - tensorflow v2.5
 - ray
 - gym
-- tensorflow_probability
 
 ## Usage
 
