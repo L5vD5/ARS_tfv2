@@ -3,7 +3,7 @@ import argparse
 from ARS import Agent
 
 def args_parse():
-    parser = argparse.ArgumentParser(description="Atari: DQN")
+    parser = argparse.ArgumentParser(description="ARS")
     parser.add_argument('--train', action="store_true", help='Train agent with given environment')
     parser.add_argument('--play', help="Play with a given weight directory")
     parser.add_argument('--n_cpu', type=int, default=4, help='Number of worker in ray')

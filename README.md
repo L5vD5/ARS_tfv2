@@ -17,7 +17,7 @@ $ python main.py --play [weight_file_path]
 
 usage: main.py [-h] [--train] [--play PLAY]
 
-Atari: DQN
+ARS
 
 optional arguments:
   -h, --help   show this help message and exit
